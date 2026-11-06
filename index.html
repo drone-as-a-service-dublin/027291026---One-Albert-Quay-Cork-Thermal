@@ -18,7 +18,6 @@
     #legendVals { display: flex; justify-content: space-between; font-size: 12px; }
     #panel button { margin-top: 8px; width: 100%; cursor: pointer; }
     #warn { display: none; margin-top: 8px; font-size: 12px; color: #ffb454; }
-    #status { margin-top: 8px; font-size: 11px; color: #8fd18f; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -33,9 +32,9 @@
     <div id="legend"></div>
     <div id="legendVals"><span id="lgLo"></span><span id="lgHi"></span></div>
     <button id="reset">Reset range</button>
+    <button id="centre">Centre image</button>
     <div style="margin-top:8px;font-size:12px;opacity:.7">Click the map to read a temperature.</div>
     <div id="warn">Temperature reading is blocked. Open this page with Live Server or from your web host, not by double-clicking the file.</div>
-    <div id="status">Finding tiles...</div>
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -43,190 +42,174 @@
   // ===== SETTINGS =====
   const T_MIN = 5.0;       // °C of darkest colour in your export
   const T_MAX = 35.0;      // °C of brightest colour in your export
-  const MIN_Z = 16;        // lowest z folder you generated
-  const NATIVE_MAX = 25;   // highest z folder you generated
-  const CENTER = [51.8968, -8.4640];  // fallback only (auto-centre finds the tiles)
+  const MIN_Z = 16;        // lowest z folder
+  const NATIVE_MAX = 25;   // highest z folder
+  const CENTER = [51.89853, -8.46222];  // One Albert Quay tiles (16/31227/21677)
 
   const STOPS = [
     [0.0,[0,0,4]],[0.1,[22,11,57]],[0.2,[66,10,104]],[0.3,[106,23,110]],
     [0.4,[147,38,103]],[0.5,[188,55,84]],[0.6,[221,81,58]],[0.7,[243,120,25]],
     [0.8,[252,165,10]],[0.9,[246,215,70]],[1.0,[252,255,164]]
   ];
-
   const $ = id => document.getElementById(id);
 
-  // ===== FIND TILES (centre + XYZ/TMS) =====
-  async function listNums(path, pngOnly) {
-    const r = await fetch(path);
-    if (!r.ok) return [];
-    const html = await r.text();
-    return [...new Set([...html.matchAll(/href="([^"]+)"/g)]
-      .map(m => decodeURIComponent(m[1]))
-      .filter(h => !pngOnly || h.endsWith('.png'))
-      .map(h => h.replace(/\/$/, '').split('/').pop().replace('.png', ''))
-      .filter(s => /^\d+$/.test(s)).map(Number))].sort((a, b) => a - b);
+  // ===== MAP =====
+  const map = L.map('map', {
+    minZoom: MIN_Z,
+    maxZoom: 25,
+    attributionControl: false,
+  }).setView(CENTER, MIN_Z);
+
+  L.tileLayer('{z}/{x}/{y}.png', {
+    minZoom: MIN_Z,
+    maxZoom: 25,
+    maxNativeZoom: NATIVE_MAX,
+    tms: false,
+    attribution: 'DAAS - DroneAsAService.com'
+  }).addTo(map);
+
+  // ===== PALETTE =====
+  const PAL = [];
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255; let j = 0;
+    while (j < STOPS.length - 2 && t > STOPS[j + 1][0]) j++;
+    const [t0, c0] = STOPS[j], [t1, c1] = STOPS[j + 1], f = (t - t0) / (t1 - t0);
+    PAL.push(c0.map((v, k) => Math.round(v + (c1[k] - v) * f)));
   }
-
-  async function findTiles() {
-    try {
-      const xs = await listNums(`${MIN_Z}/`);
-      if (!xs.length) throw new Error(`no folders listed in ${MIN_Z}/`);
-      let yMin = Infinity, yMax = -Infinity, xMin = Infinity, xMax = -Infinity;
-      for (const x of xs) {
-        const ys = await listNums(`${MIN_Z}/${x}/`, true);
-        if (!ys.length) continue;   // skip non-tile links
-        xMin = Math.min(xMin, x); xMax = Math.max(xMax, x);
-        yMin = Math.min(yMin, ys[0]); yMax = Math.max(yMax, ys[ys.length - 1]);
-      }
-      if (yMin === Infinity) throw new Error(`no png found in ${MIN_Z}/`);
-      const flip = y => (1 << MIN_Z) - 1 - y;
-      const toLL = (px, py) => L.CRS.EPSG3857.pointToLatLng(L.point(px * 256, py * 256), MIN_Z);
-      const inIreland = ll => ll.lat > 51 && ll.lat < 56;
-      const isTms = !inIreland(toLL(xMin, yMin)) && inIreland(toLL(xMin, flip(yMin)));
-      const y0 = isTms ? flip(yMax) : yMin, y1 = isTms ? flip(yMin) : yMax;
-      const bounds = L.latLngBounds(toLL(xMin, y0), toLL(xMax + 1, y1 + 1));
-      const c = bounds.getCenter();
-      return { center: [c.lat, c.lng], bounds, tms: isTms,
-               msg: `Tiles found ${isTms ? '(TMS)' : '(XYZ)'}<br>Centre: ${c.lat.toFixed(5)}, ${c.lng.toFixed(5)}` };
-    } catch (e) {
-      return { center: CENTER, tms: false, msg: `Auto-centre failed: ${e.message}` };
-    }
-  }
-
-  (async () => {
-    const found = await findTiles();
-    $('status').innerHTML = found.msg;
-    const TMS = found.tms;
-
-    // ===== BASE MAP =====
-    const map = L.map('map', {
-      minZoom: MIN_Z,
-      maxZoom: 25,
-      attributionControl: false,
-    }).setView(found.center, 19);
-    if (found.bounds) map.fitBounds(found.bounds);
-
-    L.tileLayer('{z}/{x}/{y}.png', {
-      minZoom: MIN_Z,
-      maxZoom: 25,
-      maxNativeZoom: NATIVE_MAX,
-      tms: TMS,
-      attribution: 'DAAS - DroneAsAService.com'
-    }).addTo(map);
-
-    // ===== PALETTE =====
-    const PAL = [];
+  const lut = new Map();
+  function rgbToNorm(r, g, b) {
+    const key = (r << 16) | (g << 8) | b;
+    let v = lut.get(key); if (v !== undefined) return v;
+    let best = 0, bd = Infinity;
     for (let i = 0; i < 256; i++) {
-      const t = i / 255; let j = 0;
-      while (j < STOPS.length - 2 && t > STOPS[j + 1][0]) j++;
-      const [t0, c0] = STOPS[j], [t1, c1] = STOPS[j + 1], f = (t - t0) / (t1 - t0);
-      PAL.push(c0.map((v, k) => Math.round(v + (c1[k] - v) * f)));
+      const c = PAL[i], d = (c[0]-r)**2 + (c[1]-g)**2 + (c[2]-b)**2;
+      if (d < bd) { bd = d; best = i; }
     }
-    const lut = new Map();
-    function rgbToNorm(r, g, b) {
-      const key = (r << 16) | (g << 8) | b;
-      let v = lut.get(key); if (v !== undefined) return v;
-      let best = 0, bd = Infinity;
-      for (let i = 0; i < 256; i++) {
-        const c = PAL[i], d = (c[0]-r)**2 + (c[1]-g)**2 + (c[2]-b)**2;
-        if (d < bd) { bd = d; best = i; }
+    v = best / 255; lut.set(key, v); return v;
+  }
+
+  // ===== THERMAL OVERLAY =====
+  let lo = T_MIN, hi = T_MAX, blocked = false;
+  const cache = {};
+
+  function paint(key) {
+    const { temps, canvas } = cache[key];
+    const ctx = canvas.getContext('2d'), img = ctx.createImageData(256, 256), d = img.data;
+    const span = hi - lo || 0.001;
+    for (let i = 0; i < temps.length; i++) {
+      const t = temps[i];
+      if (isNaN(t)) { d[i*4+3] = 0; continue; }
+      const n = Math.min(1, Math.max(0, (t - lo) / span));
+      const c = PAL[Math.round(n * 255)];
+      d[i*4] = c[0]; d[i*4+1] = c[1]; d[i*4+2] = c[2]; d[i*4+3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  // ===== AUTO-CENTRE ON THE IMAGE =====
+  let autoFits = 0, userMoved = false, fitTimer;
+  function fitToImage() {
+    const z = Math.min(Math.round(map.getZoom()), NATIVE_MAX);
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const key in cache) {
+      const [kz, kx, ky] = key.split('/').map(Number);
+      if (kz !== z) continue;
+      const t = cache[key].temps;
+      for (let i = 0; i < 65536; i++) {
+        if (isNaN(t[i])) continue;
+        const px = kx * 256 + (i & 255), py = ky * 256 + (i >> 8);
+        if (px < x0) x0 = px; if (px > x1) x1 = px;
+        if (py < y0) y0 = py; if (py > y1) y1 = py;
       }
-      v = best / 255; lut.set(key, v); return v;
     }
+    if (x0 === Infinity) return false;
+    map.fitBounds(L.latLngBounds(map.unproject([x0, y0], z), map.unproject([x1 + 1, y1 + 1], z)),
+                  { padding: [30, 30], animate: false });
+    return true;
+  }
+  function scheduleFit() {
+    if (userMoved || autoFits >= 4) return;
+    clearTimeout(fitTimer);
+    fitTimer = setTimeout(() => { if (!userMoved && fitToImage()) autoFits++; }, 400);
+  }
+  ['mousedown', 'wheel', 'touchstart'].forEach(ev =>
+    map.getContainer().addEventListener(ev, () => { userMoved = true; }, { passive: true }));
 
-    // ===== THERMAL OVERLAY =====
-    let lo = T_MIN, hi = T_MAX, blocked = false;
-    const cache = {};
-
-    function paint(key) {
-      const { temps, canvas } = cache[key];
-      const ctx = canvas.getContext('2d'), img = ctx.createImageData(256, 256), d = img.data;
-      const span = hi - lo || 0.001;
-      for (let i = 0; i < temps.length; i++) {
-        const t = temps[i];
-        if (isNaN(t)) { d[i*4+3] = 0; continue; }
-        const n = Math.min(1, Math.max(0, (t - lo) / span));
-        const c = PAL[Math.round(n * 255)];
-        d[i*4] = c[0]; d[i*4+1] = c[1]; d[i*4+2] = c[2]; d[i*4+3] = 255;
-      }
-      ctx.putImageData(img, 0, 0);
-    }
-
-    const ThermalLayer = L.GridLayer.extend({
-      createTile(coords, done) {
-        const canvas = document.createElement('canvas');
-        canvas.width = canvas.height = 256;
-        if (blocked) { setTimeout(() => done(null, canvas)); return canvas; }
-        const img = new Image();
-        img.onload = () => {
-          try {
-            const tmp = document.createElement('canvas');
-            tmp.width = tmp.height = 256;
-            const tctx = tmp.getContext('2d');
-            tctx.drawImage(img, 0, 0);
-            const d = tctx.getImageData(0, 0, 256, 256).data;   // throws on file://
-            const temps = new Float32Array(65536);
-            for (let i = 0; i < 65536; i++) {
-              temps[i] = d[i*4+3] < 10 ? NaN
-                : T_MIN + rgbToNorm(d[i*4], d[i*4+1], d[i*4+2]) * (T_MAX - T_MIN);
-            }
-            const key = `${coords.z}/${coords.x}/${coords.y}`;
-            cache[key] = { temps, canvas };
-            paint(key);
-          } catch (err) {
-            blocked = true;
-            $('warn').style.display = 'block';
+  const ThermalLayer = L.GridLayer.extend({
+    createTile(coords, done) {
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 256;
+      if (blocked) { setTimeout(() => done(null, canvas)); return canvas; }
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const tmp = document.createElement('canvas');
+          tmp.width = tmp.height = 256;
+          const tctx = tmp.getContext('2d');
+          tctx.drawImage(img, 0, 0);
+          const d = tctx.getImageData(0, 0, 256, 256).data;   // throws on file://
+          const temps = new Float32Array(65536);
+          for (let i = 0; i < 65536; i++) {
+            temps[i] = d[i*4+3] < 10 ? NaN
+              : T_MIN + rgbToNorm(d[i*4], d[i*4+1], d[i*4+2]) * (T_MAX - T_MIN);
           }
-          done(null, canvas);
-        };
-        img.onerror = () => done(null, canvas);
-        const fy = TMS ? (1 << coords.z) - 1 - coords.y : coords.y;
-        img.src = `${coords.z}/${coords.x}/${fy}.png`;
-        return canvas;
-      }
-    });
-
-    const thermal = new ThermalLayer({
-      minZoom: MIN_Z, maxZoom: 25, maxNativeZoom: NATIVE_MAX
-    }).addTo(map);
-    thermal.on('tileunload', e => delete cache[`${e.coords.z}/${e.coords.x}/${e.coords.y}`]);
-
-    // ===== CLICK = TEMPERATURE =====
-    map.on('click', e => {
-      if (blocked) {
-        L.popup().setLatLng(e.latlng).setContent('Open the page via Live Server or your web host to read temperatures.').openOn(map);
-        return;
-      }
-      const z = Math.min(Math.round(map.getZoom()), NATIVE_MAX);
-      const p = map.project(e.latlng, z).floor();
-      const x = Math.floor(p.x / 256), y = Math.floor(p.y / 256);
-      const c = cache[`${z}/${x}/${y}`];
-      if (!c) return;
-      const t = c.temps[(p.y - y*256) * 256 + (p.x - x*256)];
-      if (isNaN(t)) return;
-      L.popup().setLatLng(e.latlng).setContent(`<b>${t.toFixed(1)} °C</b>`).openOn(map);
-    });
-
-    // ===== RANGE CONTROL =====
-    [$('lo'), $('hi')].forEach(s => { s.min = T_MIN; s.max = T_MAX; });
-    $('lo').value = lo; $('hi').value = hi;
-    $('legend').style.background =
-      `linear-gradient(to right, ${STOPS.map(([s,c]) => `rgb(${c}) ${s*100}%`).join(',')})`;
-
-    let raf;
-    function update() {
-      lo = +$('lo').value; hi = +$('hi').value;
-      if (lo >= hi) { hi = lo + 0.1; $('hi').value = hi; }
-      $('loVal').textContent = $('lgLo').textContent = lo.toFixed(1) + ' °C';
-      $('hiVal').textContent = $('lgHi').textContent = hi.toFixed(1) + ' °C';
-      cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(() => Object.keys(cache).forEach(paint));
+          const key = `${coords.z}/${coords.x}/${coords.y}`;
+          cache[key] = { temps, canvas };
+          paint(key);
+          scheduleFit();
+        } catch (err) {
+          blocked = true;
+          $('warn').style.display = 'block';
+        }
+        done(null, canvas);
+      };
+      img.onerror = () => done(null, canvas);
+      img.src = `${coords.z}/${coords.x}/${coords.y}.png`;
+      return canvas;
     }
-    $('lo').oninput = $('hi').oninput = update;
-    $('reset').onclick = () => { $('lo').value = T_MIN; $('hi').value = T_MAX; update(); };
-    L.DomEvent.disableClickPropagation($('panel'));
-    update();
-  })();
+  });
+
+  const thermal = new ThermalLayer({
+    minZoom: MIN_Z, maxZoom: 25, maxNativeZoom: NATIVE_MAX
+  }).addTo(map);
+  thermal.on('tileunload', e => delete cache[`${e.coords.z}/${e.coords.x}/${e.coords.y}`]);
+
+  // ===== CLICK = TEMPERATURE =====
+  map.on('click', e => {
+    if (blocked) {
+      L.popup().setLatLng(e.latlng).setContent('Open the page via Live Server or your web host to read temperatures.').openOn(map);
+      return;
+    }
+    const z = Math.min(Math.round(map.getZoom()), NATIVE_MAX);
+    const p = map.project(e.latlng, z).floor();
+    const x = Math.floor(p.x / 256), y = Math.floor(p.y / 256);
+    const c = cache[`${z}/${x}/${y}`];
+    if (!c) return;
+    const t = c.temps[(p.y - y*256) * 256 + (p.x - x*256)];
+    if (isNaN(t)) return;
+    L.popup().setLatLng(e.latlng).setContent(`<b>${t.toFixed(1)} °C</b>`).openOn(map);
+  });
+
+  // ===== RANGE CONTROL =====
+  [$('lo'), $('hi')].forEach(s => { s.min = T_MIN; s.max = T_MAX; });
+  $('lo').value = lo; $('hi').value = hi;
+  $('legend').style.background =
+    `linear-gradient(to right, ${STOPS.map(([s,c]) => `rgb(${c}) ${s*100}%`).join(',')})`;
+
+  let raf;
+  function update() {
+    lo = +$('lo').value; hi = +$('hi').value;
+    if (lo >= hi) { hi = lo + 0.1; $('hi').value = hi; }
+    $('loVal').textContent = $('lgLo').textContent = lo.toFixed(1) + ' °C';
+    $('hiVal').textContent = $('lgHi').textContent = hi.toFixed(1) + ' °C';
+    cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(() => Object.keys(cache).forEach(paint));
+  }
+  $('lo').oninput = $('hi').oninput = update;
+  $('reset').onclick = () => { $('lo').value = T_MIN; $('hi').value = T_MAX; update(); };
+  $('centre').onclick = () => { fitToImage(); };
+  L.DomEvent.disableClickPropagation($('panel'));
+  update();
   </script>
 </body>
 </html>
